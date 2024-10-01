@@ -285,9 +285,13 @@ class Agency:
             raise Exception("Please install gradio: pip install gradio")
 
         js = """function () {
-          gradioURL = window.location.href
-          if (!gradioURL.endsWith('?__theme={theme}')) {
-            window.location.replace(gradioURL + '?__theme={theme}');
+          gradioURL = window.location.href;
+          if (!gradioURL.includes('__theme={theme}')) {
+            if (gradioURL.includes('?')) {
+              window.location.replace(gradioURL + '&__theme={theme}');
+            } else {
+              window.location.replace(gradioURL + '?__theme={theme}');
+            }
           }
         }"""
 
