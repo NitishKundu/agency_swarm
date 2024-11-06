@@ -92,6 +92,7 @@ class Agent():
             examples: List[ExampleMessage] = None,
             file_search: FileSearchConfig = None,
             parallel_tool_calls: bool = True,
+            refresh_from_id: bool = True,
     ):
         """
         Initializes an Agent with specified attributes, tools, and OpenAI client.
@@ -120,6 +121,7 @@ class Agent():
             examples (List[Dict], optional): A list of example messages for the agent. Defaults to None.
             file_search (FileSearchConfig, optional): A dictionary containing the file search tool configuration. Defaults to None.
             parallel_tool_calls (bool, optional): Whether to enable parallel function calling during tool use. Defaults to True.
+            refresh_from_id (bool, optional): Whether to load and update the agent from the OpenAI assistant ID when provided. Defaults to True.
 
         This constructor sets up the agent with its unique properties, initializes the OpenAI client, reads instructions if provided, and uploads any associated files.
         """
@@ -151,6 +153,7 @@ class Agent():
         self.examples = examples
         self.file_search = file_search
         self.parallel_tool_calls = parallel_tool_calls
+        self.refresh_from_id = refresh_from_id
 
         self.settings_path = './settings.json'
 
@@ -188,8 +191,10 @@ class Agent():
 
         # load assistant from id
         if self.id:
+            if not self.refresh_from_id:
+                return self
+            
             self.assistant = self.client.beta.assistants.retrieve(self.id)
-
             # Assign attributes to self if they are None
             self.instructions = self.instructions or self.assistant.instructions
             self.name = self.name if self.name != self.__class__.__name__ else self.assistant.name
@@ -211,9 +216,9 @@ class Agent():
                 if tool.type == "retrieval":
                     self.client.beta.assistants.update(self.id, tools=self.get_oai_tools())
 
-            # # update assistant if parameters are different
-            # if not self._check_parameters(self.assistant.model_dump()):
-            #     self._update_assistant()
+            # update assistant if parameters are different
+            if not self._check_parameters(self.assistant.model_dump()):
+                self._update_assistant()
 
             return self
 
@@ -547,12 +552,44 @@ class Agent():
                 print(f"Instructions mismatch: {self.instructions} != {assistant_settings['instructions']}")
             return False
 
-        tools_diff = DeepDiff(self.get_oai_tools(), assistant_settings['tools'], ignore_order=True)
-        if tools_diff != {}:
+        def clean_tool(tool):
+            if isinstance(tool, dict):
+                if 'function' in tool and 'strict' in tool['function'] and not tool['function']['strict']:
+                    tool['function'].pop('strict', None)
+            return tool
+
+        local_tools = [clean_tool(tool) for tool in self.get_oai_tools()]
+        assistant_tools = [clean_tool(tool) for tool in assistant_settings['tools']]
+
+        # find file_search and code_interpreter tools in local_tools and assistant_tools
+        # Find file_search tools in local and assistant tools
+        local_file_search = next((tool for tool in local_tools if tool['type'] == 'file_search'), None)
+        assistant_file_search = next((tool for tool in assistant_tools if tool['type'] == 'file_search'), None)
+
+        if local_file_search:
+            # If local file_search doesn't have a 'file_search' key, use assistant's if available
+            if 'file_search' not in local_file_search and assistant_file_search and 'file_search' in assistant_file_search:
+                local_file_search['file_search'] = assistant_file_search['file_search']
+            elif 'file_search' in local_file_search:
+                # Update max_num_results if not set locally but available in assistant
+                if 'max_num_results' not in local_file_search['file_search'] and assistant_file_search and \
+                   assistant_file_search['file_search'].get('max_num_results') is not None:
+                    local_file_search['file_search']['max_num_results'] = assistant_file_search['file_search']['max_num_results']
+                
+                # Update ranking_options if not set locally but available in assistant
+                if 'ranking_options' not in local_file_search['file_search'] and assistant_file_search and \
+                   assistant_file_search['file_search'].get('ranking_options') is not None:
+                    local_file_search['file_search']['ranking_options'] = assistant_file_search['file_search']['ranking_options']
+
+        local_tools.sort(key=lambda x: json.dumps(x, sort_keys=True))
+        assistant_tools.sort(key=lambda x: json.dumps(x, sort_keys=True))
+
+        tools_diff = DeepDiff(local_tools, assistant_tools, ignore_order=True)
+        if tools_diff:
             if debug:
                 print(f"Tools mismatch: {tools_diff}")
-                print("local tools: ", self.get_oai_tools())
-                print("assistant tools: ", assistant_settings['tools'])
+                print("Local tools:", local_tools)
+                print("Assistant tools:", assistant_tools)
             return False
 
         if self.temperature != assistant_settings['temperature']:
@@ -565,13 +602,31 @@ class Agent():
                 print(f"Top_p mismatch: {self.top_p} != {assistant_settings['top_p']}")
             return False
 
+        # adjust differences between local and assistant tool resources
         tool_resources_settings = copy.deepcopy(self.tool_resources)
-        if tool_resources_settings and tool_resources_settings.get('file_search'):
+        if tool_resources_settings is None:
+            tool_resources_settings = {}
+        if tool_resources_settings.get('file_search'):
             tool_resources_settings['file_search'].pop('vector_stores', None)
-        tool_resources_diff = DeepDiff(tool_resources_settings, assistant_settings['tool_resources'], ignore_order=True)
+        if tool_resources_settings.get('file_search') is None:
+            tool_resources_settings['file_search'] = {'vector_store_ids': []}
+        if tool_resources_settings.get('code_interpreter') is None:
+            tool_resources_settings['code_interpreter'] = {"file_ids": []}
+        
+        assistant_tool_resources = assistant_settings['tool_resources']
+        if assistant_tool_resources is None:
+            assistant_tool_resources = {}
+        if assistant_tool_resources.get('code_interpreter') is None:
+            assistant_tool_resources['code_interpreter'] = {"file_ids": []}
+        if assistant_tool_resources.get('file_search') is None:
+            assistant_tool_resources['file_search'] = {'vector_store_ids': []}
+
+        tool_resources_diff = DeepDiff(tool_resources_settings, assistant_tool_resources, ignore_order=True)
         if tool_resources_diff != {}:
             if debug:
                 print(f"Tool resources mismatch: {tool_resources_diff}")
+                print("Local tool resources:", tool_resources_settings)
+                print("Assistant tool resources:", assistant_settings['tool_resources'])
             return False
 
         metadata_diff = DeepDiff(self.metadata, assistant_settings['metadata'], ignore_order=True)
